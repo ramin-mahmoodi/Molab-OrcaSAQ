@@ -28,6 +28,7 @@ def _():
     import socket
     import re
     import subprocess
+    import threading
     from pathlib import Path
     import requests
 
@@ -39,6 +40,7 @@ def _():
             "cf_proc": None,
             "public_url": None,
             "work_dir": None,
+            "heartbeat_thread": None,
         }
     state_store = sys._orcasaq_molab_state
 
@@ -55,6 +57,7 @@ def _():
         state_store,
         subprocess,
         sys,
+        threading,
         time,
     )
 
@@ -477,6 +480,7 @@ def _(
     start_server_btn,
     state_store,
     subprocess,
+    threading,
     time,
     work_dir,
     zrok_name_input,
@@ -776,6 +780,28 @@ def _(
 
         state_store["public_url"] = _public_url
 
+        # Anti-Idle background heartbeat: keeps kernel active, pings llama-server, touches disk
+        def _start_heartbeat():
+            if state_store.get("heartbeat_thread") is not None and state_store["heartbeat_thread"].is_alive():
+                return
+            def _hb_loop():
+                _hb_file = work_dir / ".heartbeat"
+                while True:
+                    try:
+                        _hb_file.write_text(f"heartbeat: {time.time()}\n", encoding="utf-8")
+                        try:
+                            requests.get("http://127.0.0.1:8081/health", timeout=3)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    time.sleep(30)
+            _t = threading.Thread(target=_hb_loop, daemon=True, name="orcasaq_anti_idle")
+            _t.start()
+            state_store["heartbeat_thread"] = _t
+
+        _start_heartbeat()
+
     endpoint_info = {
         "base_url": f"{_public_url}/v1",
         "chat_completions": f"{_public_url}/v1/chat/completions",
@@ -783,11 +809,52 @@ def _(
         "api_key": _api_key,
     }
 
+    _anti_idle_html = """
+    <div style="margin: 16px 0; padding: 14px; border-radius: 8px; background: rgba(34, 197, 94, 0.08); border: 1px solid rgba(34, 197, 94, 0.35); font-family: system-ui, sans-serif;">
+      <div style="display: flex; align-items: center; justify-content: space-between;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 10px #22c55e;"></span>
+          <strong style="color: #15803d; font-size: 14px;">Anti-Idle Protection: ACTIVE</strong>
+        </div>
+        <span style="font-size: 11px; color: #166534; background: rgba(34, 197, 94, 0.15); padding: 2px 8px; border-radius: 9999px;">Screen WakeLock + WebAudio KeepAlive + 30s Heartbeat</span>
+      </div>
+      <p style="margin: 8px 0 0 0; font-size: 12px; color: #374151; line-height: 1.5;">
+        Protects your Molab container from being discarded. The browser tab is locked awake using HTML5 WebAudio and Screen WakeLock, while the Python kernel pings local health every 30 seconds.
+      </p>
+      <script>
+        (function() {
+          if (window._orcasaq_keepalive_active) return;
+          window._orcasaq_keepalive_active = true;
+          if ('wakeLock' in navigator) {
+            try { navigator.wakeLock.request('screen').catch(()=>{}); } catch(e){}
+          }
+          try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (AudioCtx) {
+              const actx = new AudioCtx();
+              const osc = actx.createOscillator();
+              const gain = actx.createGain();
+              gain.gain.value = 0.000001;
+              osc.connect(gain);
+              gain.connect(actx.destination);
+              osc.start();
+            }
+          } catch(e) {}
+          setInterval(() => {
+            try { fetch('/api/status', { method: 'GET', cache: 'no-store' }).catch(()=>{}); } catch(e){}
+          }, 25000);
+        })();
+      </script>
+    </div>
+    """
+
     refresh_btn = mo.ui.run_button(label="🔄 Refresh VRAM & Server Logs", kind="neutral")
 
     mo.md(
         f"""
         ## 🛡️ OrcaSAQ Cyber Server is ONLINE (100% in RTX Pro 6000 VRAM)
+
+        {mo.Html(_anti_idle_html)}
 
         ### 🔗 Connection Details for **Hermes**
         | Setting | Value |

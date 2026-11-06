@@ -150,11 +150,11 @@ def _(Path, mo, shutil, state_store, subprocess):
     )
     reasoning_dropdown = mo.ui.dropdown(
         options={
+            "xhigh (Deep Security & Exploit Analysis - Model Default)": "xhigh",
             "medium (Balanced - Recommended)": "medium",
             "low (Fast Response)": "low",
-            "high (Deep Security & Exploit Analysis)": "high",
         },
-        value="medium (Balanced - Recommended)",
+        value="xhigh (Deep Security & Exploit Analysis - Model Default)",
         label="Reasoning Effort",
     )
     setup_btn = mo.ui.run_button(
@@ -246,8 +246,9 @@ def _(
     def _ensure_hf_accelerator():
         try:
             import hf_transfer
+            import gguf
         except ImportError:
-            _run_cmd([sys.executable, "-m", "pip", "install", "--quiet", "hf-transfer", "huggingface_hub"])
+            _run_cmd([sys.executable, "-m", "pip", "install", "--quiet", "hf-transfer", "huggingface_hub", "gguf"])
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
     def _download_hf_model(_repo: str, _filename: str, _dest: Path, _min_bytes: int = 1024):
@@ -378,9 +379,28 @@ def _(
         _model_path = _models_dir / _MODEL_FILE
         _download_hf_model(_HF_REPO, _MODEL_FILE, _model_path, _min_bytes=14_000_000_000)
 
+        # Step 3: Extract and patch Jinja chat template to prevent "Unexpected reasoning effort high" crashes
+        _custom_template_path = work_dir / "chat_template_patched.jinja"
+        try:
+            import gguf
+            _reader = gguf.GGUFReader(str(_model_path), "r")
+            _field = _reader.get_field("tokenizer.chat_template")
+            if _field is not None:
+                _raw_tpl = bytes(_field.parts[-1]).decode("utf-8", errors="ignore")
+                _alias_header = "{%- if reasoning_effort is defined and reasoning_effort == 'high' -%}{%- set reasoning_effort = 'xhigh' -%}{%- endif -%}\n"
+                _patched_tpl = _alias_header + _raw_tpl.replace(
+                    "'xhigh', 'medium', 'low'",
+                    "'xhigh', 'high', 'medium', 'low'"
+                )
+                _custom_template_path.write_text(_patched_tpl, encoding="utf-8")
+                _logs.append("🩹 Auto-patched Jinja chat template: aliased 'high' -> 'xhigh' for Hermes/OpenAI compatibility")
+        except Exception as _tpl_err:
+            _logs.append(f"⚠️ Chat template extraction skipped: {_tpl_err}")
+
     artifacts = {
         "llama_bin": str(_llama_bin),
         "model_path": str(_model_path),
+        "chat_template_path": str(_custom_template_path) if _custom_template_path.exists() else None,
         "ready": True,
     }
 
@@ -539,6 +559,8 @@ def _(
     _parallel_val = str(parallel_dropdown.value)
     _ctx_val = str(ctx_slider.value)
     _effort_val = str(reasoning_dropdown.value)
+    if _effort_val == "high":
+        _effort_val = "xhigh"
 
     # High-performance multi-slot continuous batching flags for Hermes Agent
     _llama_cmd = [
@@ -590,6 +612,9 @@ def _(
         "--port",
         "8081",
     ]
+
+    if artifacts.get("chat_template_path"):
+        _llama_cmd.extend(["--chat-template-file", artifacts["chat_template_path"]])
 
     _api_key = (api_key_input.value or "sk-molab-local").strip()
     if _api_key:
